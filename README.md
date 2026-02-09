@@ -4,6 +4,8 @@ i dont like relying on websites to download stuff off of youtube so i made this 
 
 its only for windows because im lazy
 
+![YouTube Media Downloader Tool](https://raw.githubusercontent.com/Skittlq/ytmdt/refs/heads/v2/screenshot.png)
+
 ## features:
 
 - auto updates yt-dlp and ffmpeg
