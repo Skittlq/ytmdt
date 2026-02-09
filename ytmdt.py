@@ -262,7 +262,6 @@ def launch_ui() -> None:
 		url = url_var.get().strip()
 		if not url:
 			preview_var.set("Paste a YouTube URL to see download info")
-			download_btn.config(state=tk.DISABLED)
 			return
 
 		quality = quality_var.get()
@@ -284,7 +283,6 @@ def launch_ui() -> None:
 		cmd.append(url)
 
 		preview_var.set("Calculating size...")
-		download_btn.config(state=tk.DISABLED)
 
 		def worker() -> None:
 			try:
@@ -300,6 +298,7 @@ def launch_ui() -> None:
 					universal_newlines=True,
 					creationflags=creationflags,
 				)
+				current_preview["proc"] = process
 				sizes = []
 				for line in process.stdout:
 					line = line.strip()
@@ -309,6 +308,7 @@ def launch_ui() -> None:
 						except ValueError:
 							pass
 				process.wait()
+				current_preview["proc"] = None
 
 				if process.returncode == 0 and sizes:
 					total_bytes = sum(sizes)
@@ -327,16 +327,28 @@ def launch_ui() -> None:
 					else:
 						msg = f"Ready to download: {num_videos} videos, {size_str} total"
 					
-					root.after(0, lambda: (preview_var.set(msg), download_btn.config(state=tk.NORMAL)))
+					root.after(0, lambda: preview_var.set(msg))
 				else:
-					root.after(0, lambda: (preview_var.set("Size info unavailable, but ready to download"), download_btn.config(state=tk.NORMAL)))
+					root.after(0, lambda: preview_var.set("Size info unavailable, but ready to download"))
 			except Exception as exc:
 				log(f"Preview error: {exc}")
-				root.after(0, lambda: (preview_var.set("Preview failed, but you can still download"), download_btn.config(state=tk.NORMAL)))
+				root.after(0, lambda: preview_var.set("Preview failed, but you can still download"))
 
 		threading.Thread(target=worker, daemon=True).start()
 
+	# Store current download process and preview for cancellation
+	current_process = {"proc": None, "cancel_requested": False}
+	current_preview = {"proc": None}
+
 	def run_download() -> None:
+		# Cancel any ongoing preview
+		if current_preview["proc"]:
+			try:
+				current_preview["proc"].terminate()
+				current_preview["proc"] = None
+			except Exception:
+				pass
+		
 		url = url_var.get().strip()
 		if not url:
 			messagebox.showerror("Missing URL", "Please enter a YouTube URL.")
@@ -369,8 +381,9 @@ def launch_ui() -> None:
 
 		cmd.append(url)
 
-		# Track downloaded files
+		# Track downloaded files (only count final output files matching the container)
 		downloaded_files = []
+		final_container = container if container else "%(ext)s"
 
 		def update_progress(percent: float, info: str) -> None:
 			"""Update progress bar and info label."""
@@ -380,13 +393,19 @@ def launch_ui() -> None:
 		def parse_progress_line(line: str) -> tuple[float, str] | None:
 			"""Extract percentage and info from yt-dlp output."""
 			import re
-			# Track destination files
+			# Track destination files - only count files matching the final container format
 			if "[download] Destination:" in line:
 				parts = line.split("[download] Destination:", 1)
 				if len(parts) == 2:
 					file_path = Path(parts[1].strip())
-					if file_path not in downloaded_files:
-						downloaded_files.append(file_path)
+					# Only track files with the target container extension
+					if file_path.suffix.lstrip('.').lower() == (final_container.lower() if final_container != "%(ext)s" else ""):
+						if file_path not in downloaded_files:
+							downloaded_files.append(file_path)
+					elif final_container == "%(ext)s":
+						# If container is auto, count any destination that's not a temp file
+						if file_path not in downloaded_files and not any(x in file_path.name for x in ['.f', '.temp']):
+							downloaded_files.append(file_path)
 			# Match lines like: [download]  45.2% of 123.45MiB at 5.67MiB/s ETA 00:12
 			match = re.search(r"\[download\]\s+(\d+\.\d+)%.*?at\s+([\d.]+\w+/s)", line)
 			if match:
@@ -416,7 +435,14 @@ def launch_ui() -> None:
 					universal_newlines=True,
 					creationflags=creationflags,
 				)
-				for line in process.stdout:
+				current_process["proc"] = process
+				# Read lines one at a time to allow cancellation checks
+				while True:
+					if current_process["cancel_requested"]:
+						break
+					line = process.stdout.readline()
+					if not line:
+						break
 					log(line.rstrip())
 					progress_data = parse_progress_line(line)
 					if progress_data:
@@ -427,8 +453,21 @@ def launch_ui() -> None:
 						line_stripped = line.strip()
 						if line_stripped and not line_stripped.startswith("[download]"):
 							root.after(0, lambda l=line_stripped: progress_info_var.set(l[:80]))
-				process.wait()
-				if process.returncode == 0:
+				
+				# If cancelled, kill the process
+				if current_process["cancel_requested"]:
+					process.terminate()
+					try:
+						process.wait(timeout=2)
+					except subprocess.TimeoutExpired:
+						process.kill()
+						process.wait()
+				else:
+					process.wait()
+				
+				if current_process["cancel_requested"]:
+					root.after(0, lambda: on_download_finished(False, folder, downloaded_files, cancelled=True))
+				elif process.returncode == 0:
 					root.after(0, lambda: on_download_finished(True, folder, downloaded_files))
 				else:
 					root.after(0, lambda: on_download_finished(False, folder, []))
@@ -437,12 +476,16 @@ def launch_ui() -> None:
 				root.after(0, lambda e=str(exc): progress_info_var.set(f"Error: {e}"))
 				root.after(0, lambda: on_download_finished(False, folder, []))
 
-		def on_download_finished(success: bool, folder: Path, files: list) -> None:
+		def on_download_finished(success: bool, folder: Path, files: list, cancelled: bool = False) -> None:
 			download_btn.config(state=tk.NORMAL)
+			cancel_btn.config(state=tk.DISABLED)
+			current_process["proc"] = None
 			status_var.set("Idle")
 			if success:
 				update_progress(100, "Download completed successfully!")
 				show_completion_dialog(folder, files)
+			elif cancelled:
+				progress_info_var.set("Download cancelled. Keeping downloaded files.")
 			else:
 				progress_info_var.set("Download failed. See log.txt for details.")
 				messagebox.showerror("Download failed", "yt-dlp reported an error. See log.txt for details.")
@@ -497,9 +540,9 @@ def launch_ui() -> None:
 			y = root.winfo_y() + (root.winfo_height() // 2) - (dialog.winfo_height() // 2)
 			dialog.geometry(f"+{x}+{y}")
 
-		# Reset progress
-		
-		download_btn.config(state=tk.DISABLED)
+		# Reset progress and start download
+		current_process["cancel_requested"] = False
+		cancel_btn.config(state=tk.NORMAL)
 		status_var.set("Downloading...")
 		threading.Thread(target=worker, daemon=True).start()
 
@@ -516,15 +559,15 @@ def launch_ui() -> None:
 	url_entry.pack(fill=tk.X)
 
 	def on_url_change(*args) -> None:
-		"""Auto-trigger preview when YouTube URL is pasted."""
+		"""Auto-trigger preview when YouTube URL is pasted and enable download button."""
 		url = url_var.get().strip()
 		# Check if it looks like a YouTube URL
 		if url and ("youtube.com" in url or "youtu.be" in url):
-			# Schedule preview to run after a short delay
+			# Enable download button and schedule preview to run after a short delay
+			download_btn.config(state=tk.NORMAL)
 			root.after(500, preview_download)
 		else:
 			preview_var.set("Paste a YouTube URL to see download info")
-			download_btn.config(state=tk.DISABLED)
 
 	url_var.trace_add("write", on_url_change)
 
@@ -550,15 +593,12 @@ def launch_ui() -> None:
 		state="readonly",
 	)
 	quality_box.grid(row=1, column=0, sticky="we", padx=(0, 12))
-	quality_box.bind("<<ComboboxSelected>>", lambda e: save_settings())
-
+	quality_box.bind("<<ComboboxSelected>>", lambda e: (save_settings(), preview_download()))
 	codec_label = ttk.Label(options, text="Video codec")
 	codec_label.grid(row=0, column=1, sticky="w")
 	codec_box = ttk.Combobox(options, textvariable=codec_var, values=list(CODEC_DISPLAY.values()), state="readonly")
 	codec_box.grid(row=1, column=1, sticky="we")
-	codec_box.bind("<<ComboboxSelected>>", lambda e: save_settings())
-
-	options.columnconfigure(0, weight=1)
+	codec_box.bind("<<ComboboxSelected>>", lambda e: (save_settings(), preview_download()))
 	options.columnconfigure(1, weight=1)
 
 	container_row = ttk.Frame(main)
@@ -572,8 +612,7 @@ def launch_ui() -> None:
 		state="readonly",
 	)
 	container_box.pack(anchor="w", pady=(4, 0))
-	container_box.bind("<<ComboboxSelected>>", lambda e: save_settings())
-
+	container_box.bind("<<ComboboxSelected>>", lambda e: (save_settings(), preview_download()))
 	video_only_check = ttk.Checkbutton(
 		main,
 		text="Download video without audio",
@@ -604,10 +643,35 @@ def launch_ui() -> None:
 	progress_info_label = ttk.Label(main, textvariable=progress_info_var)
 	progress_info_label.pack(anchor="w", pady=(0, 8))
 
+	def cancel_current_download() -> None:
+		"""Cancel the current download and clean up partial files."""
+		current_process["cancel_requested"] = True
+		log("Cancel requested by user.")
+		
+		# Clean up partial/temporary files after a short delay to let worker finish
+		def cleanup() -> None:
+			folder = Path(download_var.get().strip() or default_folder_str)
+			if folder.exists():
+				for file in folder.iterdir():
+					if not file.is_file():
+						continue
+					name = file.name.lower()
+					# Delete partial/temporary files
+					if any(pattern in name for pattern in ['.f', '.tmp', '.part', '.ytdlp']):
+						try:
+							file.unlink()
+							log(f"Deleted partial file: {file.name}")
+						except Exception as exc:
+							log(f"Failed to delete {file.name}: {exc}")
+		
+		root.after(500, cleanup)
+
 	button_row = ttk.Frame(main)
 	button_row.pack(fill=tk.X, pady=(8, 0))
-	download_btn = ttk.Button(button_row, text="Download", command=run_download, state=tk.DISABLED)
+	download_btn = ttk.Button(button_row, text="Download", command=run_download)
 	download_btn.pack(side=tk.LEFT)
+	cancel_btn = ttk.Button(button_row, text="Cancel", command=cancel_current_download, state=tk.DISABLED)
+	cancel_btn.pack(side=tk.LEFT, padx=(4, 0))
 	quit_btn = ttk.Button(button_row, text="Quit", command=root.destroy)
 	quit_btn.pack(side=tk.RIGHT)
 
