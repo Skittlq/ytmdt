@@ -2,6 +2,8 @@
 
 i dont like relying on websites to download stuff off of youtube so i made this yt-dlp wrapper with a gui and its pretty neat
 
+its only for windows because im lazy
+
 ## features:
 
 - auto updates yt-dlp and ffmpeg
