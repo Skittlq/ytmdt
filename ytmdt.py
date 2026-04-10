@@ -13,6 +13,7 @@ import configparser
 import json
 import shutil
 import sys
+import time
 import zipfile
 import tkinter as tk
 import threading
@@ -26,6 +27,8 @@ import subprocess
 
 CHUNK_SIZE = 1024 * 1024  # 1 MiB chunks for streaming downloads
 USER_AGENT = "ytmdt-downloader"
+DOWNLOAD_RETRY_ATTEMPTS = 4
+DOWNLOAD_RETRY_DELAY_SECONDS = 1
 LOG_PATH = Path(__file__).resolve().parent / "log.txt"
 CONFIG_PATH = Path(__file__).resolve().parent / "config.ini"
 
@@ -107,37 +110,64 @@ def fetch_latest_asset(
 def download_asset(asset: Dict, dest_dir: Path) -> Path:
 	dest_dir.mkdir(parents=True, exist_ok=True)
 	target = dest_dir / asset["name"]
-
-	req = Request(asset["browser_download_url"], headers={"User-Agent": USER_AGENT})
+	temp_target = target.with_name(target.name + ".partial")
 
 	expected_size = asset.get("size")
 
 	if target.exists() and expected_size and target.stat().st_size == expected_size:
 		log(f"Already present and size matches: {target}")
 		return target
+	if target.exists() and expected_size and target.stat().st_size != expected_size:
+		log(
+			f"Removing stale download for {target.name}: expected {expected_size} bytes, found {target.stat().st_size}"
+		)
+		target.unlink()
 
-	try:
-		with urlopen(req) as resp:  # noqa: S310
-			size_header = resp.headers.get("Content-Length")
-			expected_size = int(size_header) if size_header else expected_size
-			written = 0
+	last_error: Exception | None = None
+	for attempt in range(1, DOWNLOAD_RETRY_ATTEMPTS + 1):
+		req = Request(
+			asset["browser_download_url"],
+			headers={"User-Agent": USER_AGENT, "Accept-Encoding": "identity"},
+		)
 
-			with target.open("wb") as fh:
-				while True:
-					chunk = resp.read(CHUNK_SIZE)
-					if not chunk:
-						break
-					fh.write(chunk)
-					written += len(chunk)
+		try:
+			if temp_target.exists():
+				temp_target.unlink()
 
-		if expected_size and written != expected_size:
-			raise RuntimeError(
-				f"Size mismatch for {target.name}: expected {expected_size} bytes, wrote {written} bytes"
-			)
+			with urlopen(req) as resp:  # noqa: S310
+				size_header = resp.headers.get("Content-Length")
+				response_size = int(size_header) if size_header else None
+				verified_size = expected_size or response_size
+				written = 0
 
-		return target
-	except (HTTPError, URLError) as exc:  # pragma: no cover - network failure handling
-		raise RuntimeError(f"Download failed for {asset.get('name')}: {exc}") from exc
+				with temp_target.open("wb") as fh:
+					while True:
+						chunk = resp.read(CHUNK_SIZE)
+						if not chunk:
+							break
+						fh.write(chunk)
+						written += len(chunk)
+
+			if verified_size and written != verified_size:
+				raise RuntimeError(
+					f"Size mismatch for {target.name}: expected {verified_size} bytes, wrote {written} bytes"
+				)
+
+			temp_target.replace(target)
+			return target
+		except (HTTPError, URLError, OSError, RuntimeError) as exc:  # pragma: no cover - network failure handling
+			last_error = exc
+			if temp_target.exists():
+				temp_target.unlink()
+			if attempt < DOWNLOAD_RETRY_ATTEMPTS:
+				log(
+					f"Download attempt {attempt}/{DOWNLOAD_RETRY_ATTEMPTS} failed for {target.name}: {exc}. Retrying ..."
+				)
+				time.sleep(DOWNLOAD_RETRY_DELAY_SECONDS)
+				continue
+			break
+
+	raise RuntimeError(f"Download failed for {asset.get('name')}: {last_error}") from last_error
 
 
 def ensure_ffmpeg_unpacked(zip_path: Path, dest_dir: Path) -> Path:
