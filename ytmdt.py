@@ -31,6 +31,23 @@ DOWNLOAD_RETRY_ATTEMPTS = 4
 DOWNLOAD_RETRY_DELAY_SECONDS = 1
 LOG_PATH = Path(__file__).resolve().parent / "log.txt"
 CONFIG_PATH = Path(__file__).resolve().parent / "config.ini"
+AUDIO_CONTAINERS = {"mp3", "m4a", "wav", "opus"}
+VIDEO_QUALITY_OPTIONS = ["144p", "240p", "360p", "480p", "720p", "1080p", "1440p", "2160p"]
+AUDIO_QUALITY_OPTIONS = ["Best Available", "320 kbps", "256 kbps", "192 kbps", "128 kbps"]
+AUDIO_SOURCE_OPTIONS = ["Best Available", "Prefer Opus", "Prefer AAC / M4A", "Prefer Vorbis"]
+AUDIO_QUALITY_MAX_ABR = {
+	"Best Available": None,
+	"320 kbps": 320,
+	"256 kbps": 256,
+	"192 kbps": 192,
+	"128 kbps": 128,
+}
+AUDIO_SOURCE_FILTERS = {
+	"Best Available": "",
+	"Prefer Opus": "[acodec*=opus]",
+	"Prefer AAC / M4A": "[acodec*=mp4a]",
+	"Prefer Vorbis": "[acodec*=vorbis]",
+}
 
 
 def log(message: str) -> None:
@@ -48,6 +65,8 @@ def load_config() -> Dict:
 		"quality": "1080p",
 		"codec": "vp9",
 		"container": "mp4",
+		"audio_quality": "Best Available",
+		"audio_source": "Best Available",
 		"video_only": "False",
 		"allow_playlist": "True",
 	}
@@ -242,8 +261,27 @@ def launch_ui() -> None:
 	quality_var = tk.StringVar(value=config["quality"])
 	codec_var = tk.StringVar(value=codec_display)
 	container_var = tk.StringVar(value=config["container"])
+	audio_quality_var = tk.StringVar(value=config["audio_quality"])
+	audio_source_var = tk.StringVar(value=config["audio_source"])
 	video_only_var = tk.BooleanVar(value=config["video_only"] == "True")
 	playlist_var = tk.BooleanVar(value=config["allow_playlist"] == "True")
+
+	def is_audio_container(container: str) -> bool:
+		"""Return True when the selected container is audio-only."""
+		return container in AUDIO_CONTAINERS
+
+	def get_audio_format_string(audio_quality: str, audio_source: str) -> str:
+		"""Build the bestaudio selector for the chosen audio settings."""
+		max_abr = AUDIO_QUALITY_MAX_ABR.get(audio_quality)
+		base_selector = "bestaudio"
+		if max_abr:
+			base_selector = f"bestaudio[abr<={max_abr}]"
+
+		codec_filter = AUDIO_SOURCE_FILTERS.get(audio_source, "")
+		preferred_selector = f"{base_selector}{codec_filter}" if codec_filter else base_selector
+		if preferred_selector != base_selector:
+			return f"{preferred_selector}/{base_selector}/bestaudio/best"
+		return f"{base_selector}/bestaudio/best"
 
 	def save_settings() -> None:
 		"""Save current UI settings to config file."""
@@ -252,6 +290,8 @@ def launch_ui() -> None:
 			"quality": quality_var.get(),
 			"codec": get_actual_codec(codec_var.get()),
 			"container": container_var.get(),
+			"audio_quality": audio_quality_var.get(),
+			"audio_source": audio_source_var.get(),
 			"video_only": str(video_only_var.get()),
 			"allow_playlist": str(playlist_var.get()),
 		}
@@ -263,13 +303,20 @@ def launch_ui() -> None:
 			download_var.set(selected)
 			save_settings()
 
-	def build_format_string(quality: str, codec: str, container: str, video_only: bool) -> str:
-		codec = get_actual_codec(codec)
-		audio_formats = {"mp3", "m4a", "wav", "opus"}
-		if container in audio_formats:
-			return "bestaudio/best"
+	def build_format_string(
+		video_quality: str,
+		video_codec: str,
+		container: str,
+		video_only: bool,
+		audio_quality: str,
+		audio_source: str,
+	) -> str:
+		if is_audio_container(container):
+			return get_audio_format_string(audio_quality, audio_source)
+
+		codec = get_actual_codec(video_codec)
 		# Map label to max height.
-		max_height = quality.replace("p", "")
+		max_height = video_quality.replace("p", "")
 		if video_only:
 			# Video without audio
 			return (
@@ -297,10 +344,19 @@ def launch_ui() -> None:
 		quality = quality_var.get()
 		codec = codec_var.get()
 		container = container_var.get()
+		audio_quality = audio_quality_var.get()
+		audio_source = audio_source_var.get()
 		video_only = video_only_var.get()
 		allow_playlist = playlist_var.get()
 
-		format_string = build_format_string(quality, codec, container, video_only)
+		format_string = build_format_string(
+			quality,
+			codec,
+			container,
+			video_only,
+			audio_quality,
+			audio_source,
+		)
 
 		# Build yt-dlp command to get file sizes
 		cmd = [str(Path(__file__).resolve().parent / "ytmdt-dependencies" / "yt-dlp.exe")]
@@ -390,10 +446,19 @@ def launch_ui() -> None:
 		quality = quality_var.get()
 		codec = codec_var.get()
 		container = container_var.get()
+		audio_quality = audio_quality_var.get()
+		audio_source = audio_source_var.get()
 		video_only = video_only_var.get()
 		allow_playlist = playlist_var.get()
 
-		format_string = build_format_string(quality, codec, container, video_only)
+		format_string = build_format_string(
+			quality,
+			codec,
+			container,
+			video_only,
+			audio_quality,
+			audio_source,
+		)
 		output_template = build_output_template(folder, container)
 
 		cmd = [str(Path(__file__).resolve().parent / "ytmdt-dependencies" / "yt-dlp.exe")]
@@ -401,9 +466,10 @@ def launch_ui() -> None:
 			cmd = ["yt-dlp"]
 
 		cmd += ["-f", format_string, "-o", output_template]
-		audio_formats = {"mp3", "m4a", "wav", "opus"}
-		if container in audio_formats:
+		if is_audio_container(container):
 			cmd += ["-x", "--audio-format", container]
+			if container != "wav":
+				cmd += ["--audio-quality", audio_quality]
 		elif container and not video_only:
 			cmd += ["--merge-output-format", container]
 		if not allow_playlist:
@@ -611,15 +677,27 @@ def launch_ui() -> None:
 	folder_btn = ttk.Button(folder_row, text="Browse", command=pick_folder)
 	folder_btn.pack(side=tk.LEFT, padx=(8, 0))
 
+	container_row = ttk.Frame(main)
+	container_row.pack(fill=tk.X, pady=(16, 0))
+	container_label = ttk.Label(container_row, text="Output container")
+	container_label.pack(anchor="w")
+	container_box = ttk.Combobox(
+		container_row,
+		textvariable=container_var,
+		values=["mp4", "mkv", "webm", "mp3", "m4a", "wav", "opus"],
+		state="readonly",
+	)
+	container_box.pack(anchor="w", pady=(4, 0))
+
 	options = ttk.Frame(main)
-	options.pack(fill=tk.X, pady=(16, 0))
+	options.pack(fill=tk.X, pady=(12, 0))
 
 	quality_label = ttk.Label(options, text="Video quality")
 	quality_label.grid(row=0, column=0, sticky="w")
 	quality_box = ttk.Combobox(
 		options,
 		textvariable=quality_var,
-		values=["144p", "240p", "360p", "480p", "720p", "1080p", "1440p", "2160p"],
+		values=VIDEO_QUALITY_OPTIONS,
 		state="readonly",
 	)
 	quality_box.grid(row=1, column=0, sticky="we", padx=(0, 12))
@@ -630,19 +708,6 @@ def launch_ui() -> None:
 	codec_box.grid(row=1, column=1, sticky="we")
 	codec_box.bind("<<ComboboxSelected>>", lambda e: (save_settings(), preview_download()))
 	options.columnconfigure(1, weight=1)
-
-	container_row = ttk.Frame(main)
-	container_row.pack(fill=tk.X, pady=(12, 0))
-	container_label = ttk.Label(container_row, text="Output container")
-	container_label.pack(anchor="w")
-	container_box = ttk.Combobox(
-		container_row,
-		textvariable=container_var,
-		values=["mp4", "mkv", "webm", "mp3", "m4a", "wav", "opus"],
-		state="readonly",
-	)
-	container_box.pack(anchor="w", pady=(4, 0))
-	container_box.bind("<<ComboboxSelected>>", lambda e: (save_settings(), preview_download()))
 	video_only_check = ttk.Checkbutton(
 		main,
 		text="Download video without audio",
@@ -658,6 +723,50 @@ def launch_ui() -> None:
 		command=save_settings,
 	)
 	playlist_check.pack(anchor="w", pady=(8, 0))
+
+	def refresh_media_option_controls() -> None:
+		"""Switch visible media controls between video and audio settings."""
+		selected_container = container_var.get()
+		if is_audio_container(selected_container):
+			quality_label.config(text="Audio quality")
+			quality_box.configure(textvariable=audio_quality_var, values=AUDIO_QUALITY_OPTIONS)
+			if audio_quality_var.get() not in AUDIO_QUALITY_OPTIONS:
+				audio_quality_var.set(AUDIO_QUALITY_OPTIONS[0])
+			quality_box.set(audio_quality_var.get())
+
+			codec_label.config(text="Audio source")
+			codec_box.configure(textvariable=audio_source_var, values=AUDIO_SOURCE_OPTIONS)
+			if audio_source_var.get() not in AUDIO_SOURCE_OPTIONS:
+				audio_source_var.set(AUDIO_SOURCE_OPTIONS[0])
+			codec_box.set(audio_source_var.get())
+
+			if video_only_check.winfo_manager():
+				video_only_check.pack_forget()
+			return
+
+		quality_label.config(text="Video quality")
+		quality_box.configure(textvariable=quality_var, values=VIDEO_QUALITY_OPTIONS)
+		if quality_var.get() not in VIDEO_QUALITY_OPTIONS:
+			quality_var.set(VIDEO_QUALITY_OPTIONS[5])
+		quality_box.set(quality_var.get())
+
+		codec_label.config(text="Video codec")
+		video_codec_options = list(CODEC_DISPLAY.values())
+		codec_box.configure(textvariable=codec_var, values=video_codec_options)
+		if codec_var.get() not in video_codec_options:
+			codec_var.set(video_codec_options[0])
+		codec_box.set(codec_var.get())
+
+		if not video_only_check.winfo_manager():
+			video_only_check.pack(anchor="w", pady=(12, 0), before=playlist_check)
+
+	def on_container_change(*_args) -> None:
+		refresh_media_option_controls()
+		save_settings()
+		preview_download()
+
+	container_box.bind("<<ComboboxSelected>>", on_container_change)
+	refresh_media_option_controls()
 
 	# Preview info display
 	preview_var = tk.StringVar(value="Paste a YouTube URL to see download info")
